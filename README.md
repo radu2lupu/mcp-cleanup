@@ -49,7 +49,7 @@ All configuration is via environment variables. You can set these in your shell 
 | Variable | Default | Description |
 |---|---|---|
 | `MCP_CLEANUP_MAX_PER_TYPE` | `3` | Max live instances per MCP type per parent app |
-| `MCP_CLEANUP_PATTERNS` | `xcodemcp playwright-mcp mcp-remote` | Space-separated list of MCP binary names to watch |
+| `MCP_CLEANUP_PATTERNS` | `xcodemcp playwright-mcp mcp-remote mcp-server-darwin-arm64` | Space-separated list of MCP binary names to watch |
 | `MCP_CLEANUP_DRY_RUN` | `0` | Set to `1` to preview without killing |
 | `MCP_CLEANUP_INTERVAL` | `300` | Seconds between auto-runs (only used at install time) |
 

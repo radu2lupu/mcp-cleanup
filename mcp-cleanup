@@ -1,10 +1,10 @@
 #!/bin/zsh
-# mcp-cleanup: Kill orphaned MCP server node processes
+# mcp-cleanup: Kill orphaned MCP server processes
 #
 # Strategy: An MCP server is "active" if the other end of its stdin pipe
 # is still held open by a live process. If the host app (Claude Code, Codex,
-# Cursor, etc.) closed its end of the pipe (session ended), the MCP server
-# is orphaned.
+# Cursor, Pencil, etc.) closed its end of the pipe (session ended), the MCP
+# server is orphaned.
 #
 # Fallback: If more than MAX_PER_TYPE instances of the same MCP exist
 # under the same parent app, kill the oldest excess ones regardless.
@@ -12,7 +12,8 @@
 # Configuration via environment variables:
 #   MCP_CLEANUP_MAX_PER_TYPE   Max instances per MCP type per parent (default: 3)
 #   MCP_CLEANUP_PATTERNS       Space-separated list of MCP binary names to watch
-#                              (default: xcodemcp playwright-mcp mcp-remote)
+#                              (default: xcodemcp playwright-mcp mcp-remote
+#                                        mcp-server-darwin-arm64)
 #   MCP_CLEANUP_DRY_RUN        Set to 1 to print what would be killed without killing
 
 MAX_PER_TYPE=${MCP_CLEANUP_MAX_PER_TYPE:-3}
@@ -21,7 +22,7 @@ DRY_RUN=${MCP_CLEANUP_DRY_RUN:-0}
 if [[ -n "$MCP_CLEANUP_PATTERNS" ]]; then
   MCP_PATTERNS=(${=MCP_CLEANUP_PATTERNS})
 else
-  MCP_PATTERNS=(xcodemcp playwright-mcp mcp-remote)
+  MCP_PATTERNS=(xcodemcp playwright-mcp mcp-remote mcp-server-darwin-arm64)
 fi
 
 log() { echo "[mcp-cleanup] $*" >&2; }
