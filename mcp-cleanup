@@ -1,0 +1,108 @@
+#!/bin/zsh
+# mcp-cleanup: Kill orphaned MCP server node processes
+#
+# Strategy: An MCP server is "active" if the other end of its stdin pipe
+# is still held open by a live process. If the host app (Claude Code, Codex,
+# Cursor, etc.) closed its end of the pipe (session ended), the MCP server
+# is orphaned.
+#
+# Fallback: If more than MAX_PER_TYPE instances of the same MCP exist
+# under the same parent app, kill the oldest excess ones regardless.
+#
+# Configuration via environment variables:
+#   MCP_CLEANUP_MAX_PER_TYPE   Max instances per MCP type per parent (default: 3)
+#   MCP_CLEANUP_PATTERNS       Space-separated list of MCP binary names to watch
+#                              (default: xcodemcp playwright-mcp mcp-remote)
+#   MCP_CLEANUP_DRY_RUN        Set to 1 to print what would be killed without killing
+
+MAX_PER_TYPE=${MCP_CLEANUP_MAX_PER_TYPE:-3}
+DRY_RUN=${MCP_CLEANUP_DRY_RUN:-0}
+
+if [[ -n "$MCP_CLEANUP_PATTERNS" ]]; then
+  MCP_PATTERNS=(${=MCP_CLEANUP_PATTERNS})
+else
+  MCP_PATTERNS=(xcodemcp playwright-mcp mcp-remote)
+fi
+
+log() { echo "[mcp-cleanup] $*" >&2; }
+
+kill_pid() {
+  local pid=$1
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "  [dry-run] would kill PID $pid"
+  else
+    kill -9 "$pid" 2>/dev/null
+  fi
+}
+
+# Collect all pipe inodes currently open by the current user's processes.
+# The "other end" of a pipe is shown as "->0xABCD..." by lsof — strip the "->".
+log "Collecting live pipe inodes..."
+all_pipe_inodes=$(lsof -u "$USER" 2>/dev/null \
+  | grep PIPE \
+  | awk '{print $NF}' \
+  | sed 's/^->//' \
+  | sort -u)
+
+killed_total=0
+
+for pattern in "${MCP_PATTERNS[@]}"; do
+  # All PIDs matching this MCP type, newest first (highest PID)
+  pids=($(pgrep -f "$pattern" 2>/dev/null | sort -rn))
+  count=${#pids[@]}
+  [[ $count -eq 0 ]] && continue
+
+  log "Found $count $pattern process(es)"
+
+  orphan_count=0
+  excess_count=0
+
+  declare -A kept_per_parent
+
+  for pid in "${pids[@]}"; do
+    ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+    [[ -z "$ppid" ]] && continue
+
+    # --- Check 1: Broken pipe (host app closed its end) ---
+    stdin_other_end=$(lsof -p "$pid" -d 0 2>/dev/null \
+      | grep PIPE \
+      | awk '{print $NF}' \
+      | sed 's/^->//' \
+      | head -1)
+
+    if [[ -n "$stdin_other_end" ]]; then
+      if ! echo "$all_pipe_inodes" | grep -qF -- "$stdin_other_end"; then
+        log "  Orphan (broken pipe) PID $pid ($pattern)"
+        kill_pid "$pid"
+        # Kill the npm exec / npx wrapper too if it has no remaining children
+        if [[ -n "$ppid" && "$ppid" != "1" ]]; then
+          parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
+          if echo "$parent_cmd" | grep -qE "npm exec|npx"; then
+            child_count=$(pgrep -P "$ppid" 2>/dev/null | wc -l | tr -d ' ')
+            [[ "$child_count" -eq 0 ]] && kill_pid "$ppid"
+          fi
+        fi
+        ((orphan_count++))
+        ((killed_total++))
+        continue
+      fi
+    fi
+
+    # --- Check 2: Too many instances under the same parent ---
+    kept=${kept_per_parent[$ppid]:-0}
+    if (( kept >= MAX_PER_TYPE )); then
+      log "  Excess (>$MAX_PER_TYPE per parent) PID $pid ($pattern)"
+      kill_pid "$pid"
+      ((excess_count++))
+      ((killed_total++))
+    else
+      kept_per_parent[$ppid]=$((kept + 1))
+    fi
+  done
+
+  unset kept_per_parent
+  [[ $orphan_count -gt 0 ]] && log "  Killed $orphan_count orphan(s)"
+  [[ $excess_count -gt 0 ]] && log "  Killed $excess_count excess duplicate(s)"
+done
+
+log "Done. Total killed: $killed_total"
