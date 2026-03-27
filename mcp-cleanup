@@ -1,109 +1,185 @@
 #!/bin/zsh
 # mcp-cleanup: Kill orphaned MCP server processes
 #
-# Strategy: An MCP server is "active" if the other end of its stdin pipe
-# is still held open by a live process. If the host app (Claude Code, Codex,
-# Cursor, Pencil, etc.) closed its end of the pipe (session ended), the MCP
-# server is orphaned.
+# Detection strategy — a process is a candidate MCP server if it matches
+# ANY of these structural signals (no hardcoded names needed):
 #
-# Fallback: If more than MAX_PER_TYPE instances of the same MCP exist
-# under the same parent app, kill the oldest excess ones regardless.
+#   1. Its parent command is "npm exec" or "npx" (stdio MCP servers)
+#   2. It runs from an npm/npx cache path (~/.npm/_npx/, node_modules/.bin/)
+#   3. It is a direct child of a known AI coding tool (Codex, Claude Code,
+#      Cursor, Windsurf, Zed, Pencil, …)
+#
+# Once candidates are found, two safety checks decide whether to kill:
+#
+#   A. Broken pipe — the other end of the process's stdin pipe is no longer
+#      held open by any live process (host app closed the session).
+#   B. Excess duplicates — more than MAX_PER_TYPE instances share the same
+#      parent; oldest ones beyond that threshold are killed.
 #
 # Configuration via environment variables:
-#   MCP_CLEANUP_MAX_PER_TYPE   Max instances per MCP type per parent (default: 3)
-#   MCP_CLEANUP_PATTERNS       Space-separated list of MCP binary names to watch
-#                              (default: xcodemcp playwright-mcp mcp-remote
-#                                        mcp-server-darwin-arm64)
-#   MCP_CLEANUP_DRY_RUN        Set to 1 to print what would be killed without killing
+#   MCP_CLEANUP_MAX_PER_TYPE   Max live instances per binary name per parent
+#                              (default: 3)
+#   MCP_CLEANUP_EXTRA_HOSTS    Additional app name patterns to treat as AI
+#                              tool hosts, space-separated
+#   MCP_CLEANUP_DRY_RUN        Set to 1 to preview without killing
 
 MAX_PER_TYPE=${MCP_CLEANUP_MAX_PER_TYPE:-3}
 DRY_RUN=${MCP_CLEANUP_DRY_RUN:-0}
 
-if [[ -n "$MCP_CLEANUP_PATTERNS" ]]; then
-  MCP_PATTERNS=(${=MCP_CLEANUP_PATTERNS})
-else
-  MCP_PATTERNS=(xcodemcp playwright-mcp mcp-remote mcp-server-darwin-arm64)
+# Known AI coding tools that spawn MCP servers.
+# Matched against the full command string of running processes.
+AI_HOST_PATTERNS=(
+  "Claude"
+  "Codex"
+  "Cursor"
+  "Windsurf"
+  "Zed"
+  "Pencil"
+  "Codeium"
+  "Aide"
+  "Continue"
+)
+# Allow the user to inject extra host patterns
+if [[ -n "$MCP_CLEANUP_EXTRA_HOSTS" ]]; then
+  AI_HOST_PATTERNS+=(${=MCP_CLEANUP_EXTRA_HOSTS})
 fi
 
-log() { echo "[mcp-cleanup] $*" >&2; }
+log()      { echo "[mcp-cleanup] $*" >&2; }
+log_v()    { [[ "${MCP_CLEANUP_VERBOSE:-0}" == "1" ]] && echo "[mcp-cleanup] $*" >&2; }
 
 kill_pid() {
-  local pid=$1
-  if [[ "$DRY_RUN" == "1" ]]; then
-    log "  [dry-run] would kill PID $pid"
-  else
+  local pid=$1 reason=$2
+  log "  Kill PID $pid — $reason"
+  if [[ "$DRY_RUN" != "1" ]]; then
     kill -9 "$pid" 2>/dev/null
   fi
 }
 
-# Collect all pipe inodes currently open by the current user's processes.
-# The "other end" of a pipe is shown as "->0xABCD..." by lsof — strip the "->".
-log "Collecting live pipe inodes..."
+# ---------------------------------------------------------------------------
+# Step 1 — collect all pipe inodes currently open by live processes.
+# lsof shows the "other end" of a pipe as "->0xABCD..."; strip the "->".
+# ---------------------------------------------------------------------------
+log "Scanning processes..."
 all_pipe_inodes=$(lsof -u "$USER" 2>/dev/null \
   | grep PIPE \
   | awk '{print $NF}' \
   | sed 's/^->//' \
   | sort -u)
 
-killed_total=0
+# ---------------------------------------------------------------------------
+# Step 2 — build the set of AI host PIDs so we can find their children.
+# ---------------------------------------------------------------------------
+ai_host_pids=()
+host_pattern=$(printf '%s|' "${AI_HOST_PATTERNS[@]}")
+host_pattern="${host_pattern%|}"   # trim trailing |
 
-for pattern in "${MCP_PATTERNS[@]}"; do
-  # All PIDs matching this MCP type, newest first (highest PID)
-  pids=($(pgrep -f "$pattern" 2>/dev/null | sort -rn))
-  count=${#pids[@]}
-  [[ $count -eq 0 ]] && continue
+while IFS= read -r line; do
+  pid=$(echo "$line" | awk '{print $2}')
+  cmd=$(echo "$line" | cut -d' ' -f11-)
+  # Exclude this script itself and common non-host matches
+  [[ "$pid" == "$$" ]] && continue
+  ai_host_pids+=("$pid")
+done < <(ps aux | grep -E "$host_pattern" | grep -v grep)
 
-  log "Found $count $pattern process(es)"
+log_v "AI host PIDs: ${ai_host_pids[*]}"
 
-  orphan_count=0
-  excess_count=0
+# ---------------------------------------------------------------------------
+# Step 3 — collect candidate MCP server PIDs using structural signals.
+# ---------------------------------------------------------------------------
+declare -A candidate_pids  # pid -> name (for logging)
 
-  declare -A kept_per_parent
+# Signal A: parent is "npm exec" or "npx"
+while IFS= read -r line; do
+  pid=$(echo "$line" | awk '{print $1}')
+  ppid=$(echo "$line" | awk '{print $2}')
+  cmd=$(echo "$line" | cut -d' ' -f3-)
+  parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
+  if echo "$parent_cmd" | grep -qE "^npm exec|^npx "; then
+    name=$(basename "$(echo "$cmd" | awk '{print $1}')")
+    candidate_pids[$pid]="$name (npm exec child)"
+    log_v "  Candidate $pid ($name) — npm exec child"
+  fi
+done < <(ps -eo pid,ppid,command | grep -v grep | tail -n +2)
 
-  for pid in "${pids[@]}"; do
-    ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
-    [[ -z "$ppid" ]] && continue
+# Signal B: runs from an npm/npx cache path
+while IFS= read -r line; do
+  pid=$(echo "$line" | awk '{print $2}')
+  cmd=$(echo "$line" | cut -d' ' -f11-)
+  if echo "$cmd" | grep -qE "\.npm/_npx/|\.npm/bin/|node_modules/\.bin/"; then
+    name=$(basename "$(echo "$cmd" | awk '{print $1}')")
+    candidate_pids[$pid]="${candidate_pids[$pid]:-$name (npx cache)}"
+    log_v "  Candidate $pid ($name) — npx cache path"
+  fi
+done < <(ps aux | grep -v grep)
 
-    # --- Check 1: Broken pipe (host app closed its end) ---
-    stdin_other_end=$(lsof -p "$pid" -d 0 2>/dev/null \
-      | grep PIPE \
-      | awk '{print $NF}' \
-      | sed 's/^->//' \
-      | head -1)
-
-    if [[ -n "$stdin_other_end" ]]; then
-      if ! echo "$all_pipe_inodes" | grep -qF -- "$stdin_other_end"; then
-        log "  Orphan (broken pipe) PID $pid ($pattern)"
-        kill_pid "$pid"
-        # Kill the npm exec / npx wrapper too if it has no remaining children
-        if [[ -n "$ppid" && "$ppid" != "1" ]]; then
-          parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
-          if echo "$parent_cmd" | grep -qE "npm exec|npx"; then
-            child_count=$(pgrep -P "$ppid" 2>/dev/null | wc -l | tr -d ' ')
-            [[ "$child_count" -eq 0 ]] && kill_pid "$ppid"
-          fi
-        fi
-        ((orphan_count++))
-        ((killed_total++))
-        continue
-      fi
+# Signal C: direct child of a known AI host AND looks like an MCP binary
+# (runs from an app bundle's Resources/out/, or has "mcp" in its path/name)
+# Shells, system utilities, and helper frameworks are excluded.
+EXCLUDE_BINARIES="zsh|bash|sh|fish|python|ruby|perl|node|npm|npx|deno|git|curl|grep|awk|sed"
+for host_pid in "${ai_host_pids[@]}"; do
+  while IFS= read -r child_pid; do
+    [[ -z "$child_pid" ]] && continue
+    child_cmd=$(ps -p "$child_pid" -o command= 2>/dev/null)
+    child_bin=$(basename "$(echo "$child_cmd" | awk '{print $1}')")
+    # Skip shells, interpreters, and system paths
+    echo "$child_bin" | grep -qE "^($EXCLUDE_BINARIES)$" && continue
+    echo "$child_cmd" | grep -qE "/System/|/usr/lib/|\.framework/" && continue
+    # Only include if the path or binary name contains "mcp" or "server",
+    # but not if the child is itself one of the known AI host apps
+    echo "$child_cmd" | grep -qE "$host_pattern" && continue
+    if echo "$child_cmd" | grep -qiE "mcp|[-_]server"; then
+      candidate_pids[$child_pid]="${candidate_pids[$child_pid]:-$child_bin (host child)}"
+      log_v "  Candidate $child_pid ($child_bin) — child of host PID $host_pid"
     fi
-
-    # --- Check 2: Too many instances under the same parent ---
-    kept=${kept_per_parent[$ppid]:-0}
-    if (( kept >= MAX_PER_TYPE )); then
-      log "  Excess (>$MAX_PER_TYPE per parent) PID $pid ($pattern)"
-      kill_pid "$pid"
-      ((excess_count++))
-      ((killed_total++))
-    else
-      kept_per_parent[$ppid]=$((kept + 1))
-    fi
-  done
-
-  unset kept_per_parent
-  [[ $orphan_count -gt 0 ]] && log "  Killed $orphan_count orphan(s)"
-  [[ $excess_count -gt 0 ]] && log "  Killed $excess_count excess duplicate(s)"
+  done < <(pgrep -P "$host_pid" 2>/dev/null)
 done
 
-log "Done. Total killed: $killed_total"
+total_candidates=${#candidate_pids[@]}
+log "Found $total_candidates candidate MCP server process(es)"
+[[ $total_candidates -eq 0 ]] && { log "Nothing to do."; exit 0; }
+
+# ---------------------------------------------------------------------------
+# Step 4 — apply kill checks to each candidate.
+# ---------------------------------------------------------------------------
+killed_total=0
+declare -A kept_per_key  # "ppid:name" -> count of kept instances
+
+for pid in "${(@k)candidate_pids}"; do
+  name="${candidate_pids[$pid]}"
+  ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+  [[ -z "$ppid" ]] && continue
+
+  # -- Check A: broken stdin pipe --
+  stdin_other_end=$(lsof -p "$pid" -d 0 2>/dev/null \
+    | grep PIPE \
+    | awk '{print $NF}' \
+    | sed 's/^->//' \
+    | head -1)
+
+  if [[ -n "$stdin_other_end" ]]; then
+    if ! echo "$all_pipe_inodes" | grep -qF -- "$stdin_other_end"; then
+      kill_pid "$pid" "orphan — broken stdin pipe ($name)"
+      # Clean up npm exec / npx wrapper if now childless
+      parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
+      if echo "$parent_cmd" | grep -qE "npm exec|^npx "; then
+        remaining=$(pgrep -P "$ppid" 2>/dev/null | wc -l | tr -d ' ')
+        [[ "$remaining" -eq 0 ]] && kill_pid "$ppid" "childless npm exec wrapper"
+      fi
+      ((killed_total++))
+      continue
+    fi
+  fi
+
+  # -- Check B: too many instances of the same binary under the same parent --
+  binary_name=$(basename "$(ps -p "$pid" -o command= 2>/dev/null | awk '{print $1}')")
+  key="${ppid}:${binary_name}"
+  kept=${kept_per_key[$key]:-0}
+  if (( kept >= MAX_PER_TYPE )); then
+    kill_pid "$pid" "excess duplicate ($binary_name, >$MAX_PER_TYPE per parent)"
+    ((killed_total++))
+  else
+    kept_per_key[$key]=$((kept + 1))
+  fi
+done
+
+log "Done. Killed $killed_total process(es)."
