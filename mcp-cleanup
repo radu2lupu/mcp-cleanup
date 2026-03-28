@@ -170,12 +170,28 @@ for pid in "${(@k)candidate_pids}"; do
     fi
   fi
 
-  # -- Check B: too many instances of the same binary under the same parent --
-  binary_name=$(basename "$(ps -p "$pid" -o command= 2>/dev/null | awk '{print $1}')")
-  key="${ppid}:${binary_name}"
+  # -- Check B: too many instances of the same MCP server under the same ancestor --
+  # For npm exec children, key by grandparent (the actual AI host) not the
+  # direct npm exec wrapper — otherwise each wrapper looks unique and count=1.
+  # Also resolve the real MCP name: for "node /path/to/xcodemcp" use "xcodemcp",
+  # not "node", so each server type gets its own independent counter.
+  full_cmd=$(ps -p "$pid" -o command= 2>/dev/null)
+  first_arg=$(echo "$full_cmd" | awk '{print $2}')
+  if [[ -n "$first_arg" && "$first_arg" != -* ]]; then
+    mcp_name=$(basename "$first_arg")
+  else
+    mcp_name=$(basename "$(echo "$full_cmd" | awk '{print $1}')")
+  fi
+  parent_cmd=$(ps -p "$ppid" -o command= 2>/dev/null)
+  if echo "$parent_cmd" | grep -qE "npm exec|^npx "; then
+    ancestor=$(ps -p "$ppid" -o ppid= 2>/dev/null | tr -d ' ')
+  else
+    ancestor="$ppid"
+  fi
+  key="${ancestor}:${mcp_name}"
   kept=${kept_per_key[$key]:-0}
   if (( kept >= MAX_PER_TYPE )); then
-    kill_pid "$pid" "excess duplicate ($binary_name, >$MAX_PER_TYPE per parent)"
+    kill_pid "$pid" "excess duplicate ($mcp_name, >$MAX_PER_TYPE per parent)"
     ((killed_total++))
   else
     kept_per_key[$key]=$((kept + 1))
